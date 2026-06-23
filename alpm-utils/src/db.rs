@@ -258,9 +258,75 @@ impl<'a> DbListExt<'a> for AlpmList<'_, &'a Db> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    struct Pkg {
+        name: &'static str,
+        version: &'static str,
+        by_dep: bool,
+        depends: &'static [&'static str],
+        optdepends: &'static [&'static str],
+        provides: &'static [&'static str],
+    }
+
+    // Synthetic local db exercising orphan/unneeded detection. Generated at
+    // runtime instead of committed as fixture files.
+    const UNNEEDED_DB: &[Pkg] = &[
+        Pkg { name: "explicit-app", version: "1.0-1", by_dep: false, depends: &["needed-lib", "virtual-dep"], optdepends: &["opt-dep: optional feature"], provides: &[] },
+        Pkg { name: "needed-lib", version: "1.0-1", by_dep: true, depends: &[], optdepends: &[], provides: &[] },
+        Pkg { name: "opt-dep", version: "1.0-1", by_dep: true, depends: &[], optdepends: &[], provides: &[] },
+        Pkg { name: "orphan-a", version: "1.0-1", by_dep: true, depends: &["orphan-b"], optdepends: &[], provides: &[] },
+        Pkg { name: "orphan-b", version: "1.0-1", by_dep: true, depends: &["orphan-c"], optdepends: &[], provides: &[] },
+        Pkg { name: "orphan-c", version: "1.0-1", by_dep: true, depends: &[], optdepends: &[], provides: &[] },
+        Pkg { name: "orphan-consumer", version: "1.0-1", by_dep: true, depends: &["orphan-virtual"], optdepends: &[], provides: &[] },
+        Pkg { name: "orphan-provider", version: "1.0-1", by_dep: true, depends: &[], optdepends: &[], provides: &["orphan-virtual"] },
+        Pkg { name: "provider-pkg", version: "1.0-1", by_dep: true, depends: &[], optdepends: &[], provides: &["virtual-dep"] },
+    ];
+
+    fn section(out: &mut String, tag: &str, vals: &[&str]) {
+        if vals.is_empty() {
+            return;
+        }
+        out.push_str(&format!("%{tag}%\n"));
+        for v in vals {
+            out.push_str(v);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+
+    fn unneeded_db_path() -> &'static Path {
+        // ponytail: leaks one tmp dir per test process; /tmp is OS-cleaned.
+        // Reach for tempfile if cleanup ever matters.
+        static DB: OnceLock<PathBuf> = OnceLock::new();
+        DB.get_or_init(|| {
+            let root = std::env::temp_dir().join(format!("alpm-rs-unneeded-db-{}", std::process::id()));
+            let local = root.join("local");
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&local).unwrap();
+            std::fs::write(local.join("ALPM_DB_VERSION"), "9\n").unwrap();
+            for pkg in UNNEEDED_DB {
+                let dir = local.join(format!("{}-{}", pkg.name, pkg.version));
+                std::fs::create_dir_all(&dir).unwrap();
+                let mut desc = String::new();
+                section(&mut desc, "NAME", &[pkg.name]);
+                section(&mut desc, "VERSION", &[pkg.version]);
+                if pkg.by_dep {
+                    section(&mut desc, "REASON", &["1"]);
+                }
+                section(&mut desc, "DEPENDS", pkg.depends);
+                section(&mut desc, "OPTDEPENDS", pkg.optdepends);
+                section(&mut desc, "PROVIDES", pkg.provides);
+                std::fs::write(dir.join("desc"), desc).unwrap();
+                std::fs::write(dir.join("files"), "").unwrap();
+            }
+            root
+        })
+    }
 
     fn test_handle() -> Alpm {
-        Alpm::new("/", "../alpm/tests/unneeded_db").unwrap()
+        Alpm::new("/", unneeded_db_path().to_str().unwrap()).unwrap()
     }
 
     fn unneeded_names(handle: &Alpm, keep_optional: bool) -> Vec<&str> {
